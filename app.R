@@ -52,7 +52,7 @@ server <- function(input, output) {
                 ggplot(aes(award_win,worldwide)) +
                 geom_point() +
                 xlab("Award Win") +
-                ylab("Cumulative Worldwide Gross (US dollar)") +
+                ylab("Cumulative Worldwide Gross (US dollars)") +
                 scale_y_log10()
         }
     })
