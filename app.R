@@ -50,11 +50,17 @@ ui <- fluidPage(
              fluidRow(
                column(width = 12,
                       plotOutput("scatterplot",
-                                 click = "sp_click"))),
+                                 click = "sp_click",brush = brushOpts(
+                                   id = "plot1_brush"
+                                 )))),
              fluidRow(
-               column(width = 12,
-                      h4("points near click"),
+               column(width = 6,
+                      h4("Points near click"),
                       verbatimTextOutput("click_info")
+               ),
+               column(width = 6,
+                      h4("Brushed points"),
+                      verbatimTextOutput("brush_info")
                )
              )
     )
@@ -117,7 +123,8 @@ server <- function(input, output) {
     m <- data.frame(m)
   })
   
-  click <- reactive(all_movies[, c("year", "title", "rating_all","cumulative_worldwide_gross","genres")] %>% filter(year == input$year))
+  click <- reactive(movies()[, c("year", "title", "rating_all","cumulative_worldwide_gross","genres",
+                                 "director", "writer","cast", "award_win", "winner_oscar")])
   output$scatterplot = renderPlot({
     if (input$x == "Rating All"){
       movies() %>%
@@ -136,6 +143,9 @@ server <- function(input, output) {
   })
   output$click_info <- renderPrint({
     nearPoints(click(),input$sp_click, addDist = TRUE)
+  })
+  output$brush_info <- renderPrint({
+    brushedPoints(click(), input$plot1_brush)
   })
 }
 
