@@ -1,0 +1,488 @@
+---
+title: "Logistic Regression"
+author: Jie Sun
+output: html_document
+---
+
+## What Makes a Good Movie? 
+
+Imagine you are going to pick the next movie to watch during Christmas. Your decision factors may include: 
+
+* Are my favorite actors in the movie? 
+* Is this an action movie or drama? 
+* What do other people say about the movie?
+
+In this project we would like to do something different. Instead of being the audience, we will take the **investor's perspective** to see which movie project to invest. We should then decide on 2 questions: 
+
+* How do I define 'success'? It could be ratings or box-office results. Very often, they are inconsistent with each other. 
+* What makes a movie successful? This could involve the quality of the screenplay, cast, director, music, etc. Not all factors are measurable. 
+
+We obtain data between 2020-2020 from one of the largest movie database in the world, **IMDB**. In the following sections, we will do regression analysis of the data. 
+
+## Basic Data Processing
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(pROC)
+```
+
+We first read in the data. There are 2 files of 78710 rows in each.
+
+* **Data_info_00to20.RDS**: contains information of the title, year, rating, award, sales, genre, etc. 
+* **Data_people_00to20.RDS**: contains people-related information of the movie, such as the director, writer and cast. 
+
+The same row of both files correspond to 1 unique IMDB movie, linked by the IMDB movie ID column in both. They were split into 2 files simply for the convenience of data scraping. To conduct regression analysis, we need to combine them into 1 single data frame, and remove the original data to save space. 
+
+```{r}
+d1 = readRDS('data/Data_info_00to20.RDS')
+d2 = readRDS('data/Data_people_00to20.RDS')
+
+d3 <- d2 %>% dplyr::select(-imdb_ID) %>% bind_cols(d1) 
+
+rm(d1,d2) 
+
+head(d3)
+```
+The complete data `d3` contains 62 variables. The preview above does not display the variables such as `director` well, as they are lists of characters. For example, we have multiple names in the `cast` data: 
+
+```{r, warning=FALSE}
+head(d3$cast,2)
+```
+To keep all the people-related information in the data, and also for the convenience of data processing later, we use lists of characters for columns associated with names. This is also why we save the data in the .RDS format instead of data frames. 
+
+Next, we remove rows containing NAs in the following variables of interest: `cast`, `director`, `cumulative_worldwide_gross`, `rating_all`, `genre`, as they are most relevant measures of the quality of a movie. We discard variables such as `length` and `language`, because those are less likely to determine the success.  
+
+```{r, warning=FALSE}
+d3 <- d3 %>% filter(!is.na(cast) & !is.na(director) & !is.na(cumulative_worldwide_gross) & !is.na(rating_all) & !is.na(genres))
+
+```
+
+Since awards or nominations of awards can also indicate good reception, we will check if a movie has received an award or nomination, by replacing the NAs with 0, for easy calculation later. 
+
+```{r, warning=FALSE}
+d3$award_win = replace_na(d3$award_win,0)
+d3$award_nom = replace_na(d3$award_nom,0)
+d3$winner_oscar = replace_na(d3$winner_oscar,0)
+d3$nominee_oscar = replace_na(d3$nominee_oscar,0)
+```
+
+Lastly, we will drop the columns that are irrelevant for this study to avoid overloading R:
+
+```{r, warning=FALSE}
+d3<- d3 %>% select(award_win,award_nom,winner_oscar,nominee_oscar,
+                    cumulative_worldwide_gross,cast,rating_all,genres,
+                    year,director, imdb_ID, title) 
+
+head(d3)
+```
+
+Our main dataframe `d3` now has 12983 rows (unique movies), instead of 78710 at the beginning. 
+
+```{r, warning=FALSE}
+dim(d3)
+```
+
+To summarize, below are our variables of interest for each movie: 
+
+* `cumulative_worldwide_gross`: numeric. Cumulative box-office sales worldwide, in USD
+
+* `cast`: a list of character strings of actors
+
+* `rating_all`: numeric. overall rating of the movie
+
+* `genres`: categorical. There are 21 genres.
+
+* `director`: a list of character strings of directors
+
+## Create Variables
+
+Our objective is to identify the next successful movie to invest, so we need a way to calculate the *probability of success* of a movie. It boils down to define an outcome variable of success (Y) and several predictors (X).
+
+### 2 definitions of success
+
+####1. Good ratings or award-winning
+
+Ratings are highly dependent on the size of the rating population, but they are generally good indicators of the _reputation_ of a movie. Likewise, winning or being nominated of an award suggests that the movie has met certain artistic quality (we hope). Under these two criteria, some low-budget or niche movies may not have reached the wider public, but they can be considered 'successful'. 
+
+We define `outcome` as our Y variable - version 1 of success. It is binary, and is constructed this way: 
+* 1 = success (if the overall rating > 7, _or_ won _or_ was nominated by an award)
+* 0 = failure (otherwise)
+
+The cut-off of the 7-point rating is based on our own experience, since life is too short for low-rating movies. The type of awards that a movie has won is not indicated in the dataset, and we are aware that an Oscar speaks louder than anything else. However, we cannot get into those details with the current data, so we take a binary approach, just to demonstrate the concept. 
+
+```{r, warning=FALSE}
+d3.1 = d3 %>% 
+  rowwise %>%
+  mutate(win_nom = sum(award_win, award_nom, winner_oscar, nominee_oscar)) %>%
+  mutate(win_nom_tf = (win_nom > 0)) %>%
+  mutate(good_rate = rating_all > 7) %>%
+  mutate(outcome = as.numeric(good_rate | win_nom_tf))
+
+rm(d3)
+```
+
+#### 2. Good box-office performance
+
+As an investor, the only thing that matters is good sales. We define `outcome2` as our version 2 of Y variable, for another set of analysis. It is again defined as binary: 
+* 1 = success (if the movie is ranked in the top 10% percentile of all movies in the same year, in terms of worldwide sales)
+* 0 = failure (otherwise)
+
+```{r, warning=FALSE}
+d3.1 <- d3.1 %>% group_by(year) %>%
+  mutate(top10 = quantile(cumulative_worldwide_gross,0.9))%>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(outcome2 = as.numeric(cumulative_worldwide_gross > top10)) 
+
+```
+
+Note that this is a comparison with movies in the same year, as we need to address the movie market's year-on-year growth in the world. The cut-off of top 10% is just a rule of thumb. We can of course revise it to 20% or even 50%. But to demonstrate why we take 10% in this analysis, take a look at the following histogram of the worldwide movie sales:
+
+```{r, warning=FALSE}
+d3.1 %>% ggplot() +
+  geom_histogram(aes(cumulative_worldwide_gross)) +
+  xlab("Cumulative Worldwide Gross Sales (USD)") + 
+  ylab("Number of Movies") +
+  ggtitle("Frequency Counts of Movie Sales") 
+
+```
+The distribution gives you a clear view of the cruelty of investing in the filming industry. Most movies get very little sales, so it makes sense to be selective and focus on identifying the real blockbusters.
+
+On another note, we define Y variables as binary, because we hope to implement logistic regression in this analysis to predict the probability of success. 
+
+### What are the predictors
+
+We define the following X variables: 
+
+#### 1. X1 (categorical): the primary genre of each movie. 
+
+A movie can be both a drama and a thriller. Or even horror and comedy. On IMDB, we can assume that the tag that comes the first is the main genre determined by the producer. We take it as our primary genre of the movie, to simply the calculation afterwards. 
+
+```{r, warning=FALSE}
+x1 = c()
+for (i in 1:nrow(d3.1)){
+  x1[i]<-d3.1$genres[[i]][1]
+}
+
+x1 <- data.frame(x1)
+d3.1 <- bind_cols(d3.1,x1)
+
+rm(x1)
+```
+
+There are 21 genres in our dataset: 
+
+```{r, warning=FALSE}
+genr_collect = na.omit(unique(unlist(d3.1$genres))) 
+genr_collect
+```
+
+#### 2. X2 (numeric): quality of the director of each movie.
+
+Again, we encounter the problem of defining what's _good_. Here is the approach we take:
+
+* If a movie has won an award or a nomination: director's score of this movie +1 
+* If a movie has rating > 7: director's score of this movie +1
+* If a movie has neither won an award/nomination, and has rating lower than 7: director's score of the movie = 0
+
+Therefore, for each movie, a director can receive a score of 0, 1 or 2. Next,
+
+* Take the average score that a director has received, across all the movies that he/she directed. This will result in a personal score per director over his career in the past 20 years. This will be the X2 variable in the analysis.   
+
+```{r, warning=FALSE}
+dir_score = c() #score of director by movie (0,1,2)
+dir_lst = c() #main director by movie
+for (i in 1:nrow(d3.1)){
+  dir_score[i] = as.numeric(d3.1$win_nom_tf[i]) + as.numeric(d3.1$good_rate[i])
+  dir_lst[i] = d3.1$director[[i]][1]
+}
+
+d3.2 = cbind(d3.1,dir_score,dir_lst)
+d3.3 <- d3.2 %>% group_by(dir_lst) %>% mutate(x2 = mean(dir_score)) 
+
+# unique director and their overall score 
+dscore = cbind(dir_lst,d3.3$x2)
+dscore <- dscore[!duplicated(dscore[,'dir_lst']),]
+
+rm(d3.1,d3.2)
+```
+
+Some top directors below: 
+
+```{r, warning=FALSE}
+d3.3 %>% arrange(desc(dir_score)) %>% select(dir_lst,dir_score) %>% head()
+```
+The higher the score (close to 2), the better the director. You may think that this definition of the X2 variable (quality of director) is not entirely sound. Improvements we can think of include: 
+* Give 10 if a director has won an Oscar (however, it will not make a big difference to the model as most directors have not won an Oscar) 
+* Include the movie sales to construct the score. 
+* X2 is currently an average, but we can also make it a sum of the total scores that the director has achieved.
+
+Please see the discussion section for a further elaboration on why we finally decide to adopt the current way of constructing the score. 
+
+
+#### 3. X3 (numeric): quality of the cast of each movie.
+
+The calculation of this variable is more complicated. We primarily use the overall rating of the movie `rating_all` to develop the score. For example, _The Hobbit_ is rated 7.8, then: 
+
+* **Step 1**: If an actor is the leading actor of the movie, he/she takes the full rating score. i.e. Martin Freeman (Bilbo) gets 7.8 from this movie.
+  + How do we know who is the main actor? We take the first 2 actors in the cast list. As a rule of thumb, a movie usually has less than 3 main actors. 
+  
+* **Step 2**: If an actor is the supporting actor, he/she takes 10% of the rating score. i.e. Lee Pace (Thranduil) gets 0.78 from this movie. 
+  + Why do we decide on the 10% cut-off? Again, supporting actors get way less credit than main actors. This is also the reality of the entertainment industry: it is a winner-take-all world. 
+  + We also set the credit low such that if an actor appears in multiple movies as the supporting actor, his/her cumulative credit generally does not exceed that of an actor who normally plays the main role.  
+  
+* **Step 3**: For each actor, add scores from every movie he/she played in. This is the actor's _quality score_. 
+
+```{r, warning=FALSE}
+d3.4 <- d3.3 %>% arrange(desc(cumulative_worldwide_gross)) #arrange the dataset by descending order of sales
+
+k <- rep(1:NROW(d3.4),times = sapply(d3.4$cast, length))
+tmp <- d3.4[k, c("imdb_ID","title", "rating_all")] %>%
+  group_by(title)%>%
+  mutate(z = 1:n())%>%
+  ungroup()%>%
+  mutate(w = ifelse(z>2, 0.1, 1),
+         actor = unlist(d3.4$cast))
+
+actor_score <- tmp %>% rowwise() %>%
+  mutate(s = rating_all * w) %>%
+  ungroup() %>% 
+  group_by(actor) %>%
+  summarise(as = sum(s)) %>% 
+  arrange(desc(as)) # Actor_adjusted score
+
+rm(d3.3)
+```
+
+The higher the score, the more main roles the actor has played, and potentially the movies are highly rated. It is of course possible that an actor has played in many lower-rating movies and wins by the quantity, but that exception is not the main trend. Below is the top actors based on our scoring. 
+
+```{r, warning=FALSE}
+head(actor_score,10)
+```
+(Not too far off! :)
+
+There are 310000+ unique actors in total. The average number of actors per movie is around 30.
+
+* **Step 4**: For each movie, we calculate the cast score as a weighted sum of the actor's quality score. 2 main actors contribute 100% of their personal quality score, while supporting actors contribute 10% of their personal quality score. This weighted sum is the X3 (cast_score) variable in our analysis. 
+  + This is consistent with the way we define actor's personal quality score. It also reflects the fact that movies with successful main actors are more likely to succeed. 
+  
+```{r, warning=FALSE}
+tmp2 = tmp %>% left_join(actor_score,by = 'actor') %>%
+  rowwise()%>%
+  mutate(q = as * w) #the score this actor is contributing to the cast of this movie
+tmp3 <- tmp2 %>% 
+  group_by(title) %>%
+  summarise(cast_score = sum(q)) %>%
+  ungroup() #ID, cast_score
+
+d3.5 <- d3.4 %>% left_join(tmp3,by = 'title') #outcome, x1,x2, x3(cast_score)
+
+rm(d3.4)
+```
+
+To take a look at the `cast_score` of several movies: 
+
+```{r, warning=FALSE}
+d3.5 %>% ungroup() %>% select(title,cast_score) %>% head()
+```
+
+#### 4. X3.2 (numeric): quality of the cast of each movie, but with a 2nd version of weight assignment.  
+
+Instead of picking 2 main actors per movie, and giving supporting actors only 10% of the rating credit (the capitalist!), we decide to be more socialist. We now define that the first *4* actors of the cast are main actors, and each supporting actor should get *20%* of the rating credit. 
+
+We repeat the rest processes and obtain a slightly different variable for the same concept: X3.2 (cast_score2). 
+
+```{r, warning=FALSE}
+k <- rep(1:NROW(d3.5),times = sapply(d3.5$cast, length))
+tmp <- d3.5[k, c("imdb_ID","title", "rating_all")] %>%
+  group_by(title)%>%
+  mutate(z = 1:n())%>%
+  ungroup()%>%
+  mutate(w = ifelse(z>4, 0.2, 1),
+         actor = unlist(d3.5$cast))
+
+actor_score2 <- tmp %>% rowwise() %>%
+  mutate(s = rating_all * w) %>%
+  ungroup() %>% 
+  group_by(actor) %>%
+  summarise(as = sum(s)) %>% 
+  arrange(desc(as)) # Actor_adjusted score
+
+tmp2 = tmp %>% left_join(actor_score,by = 'actor') %>%
+  rowwise()%>%
+  mutate(q = as * w) #the score this actor is contributing to the cast of this movie
+tmp3 <- tmp2 %>% 
+  group_by(title) %>%
+  summarise(cast_score2 = sum(q)) %>%
+  ungroup() #ID, cast_score2
+
+d3.6 <- d3.5 %>% left_join(tmp3,by = 'title') #outcome, x1,x2, x3.2(cast_score but version 2)
+
+rm(d3.5,tmp,tmp2,tmp3,k)
+```
+
+To view the `cast_score2` of several movies: 
+
+```{r, warning=FALSE}
+d3.6 %>% ungroup() %>% select(title,cast_score2) %>% head()
+```
+There are certainly inflation of the score, but we will see if this transformation actually influences the modeling later. 
+
+## Modeling
+
+We will use logistic regression in this analysis, because we define the success as binary. 
+
+First of all, let's take only the necessary variables for analysis. 
+
+```{r, warning=FALSE}
+d3.7 <- d3.6 %>% ungroup() %>% dplyr::select(outcome,outcome2,x1,x2,cast_score,cast_score2)
+```
+
+We will use 90% of the data to train, and 10% of the data to test. 
+
+```{r, warning=FALSE}
+set.seed(100)
+n_test <- round(nrow(d3.7)/10) #1300 tests, 10%
+test_indices <- sample(1: nrow(d3.7),n_test,replace = FALSE)
+d_test <- d3.7[test_indices,]
+d_train <- d3.7[-test_indices,]
+```
+
+### Model 1
+
+The model we use here: 
+
+* outcome ~ genres(X1) + director's quality(X2) + cast's quality(X3)
+
+```{r, warning=FALSE}
+lm_mod1 = glm(outcome ~ as.factor(x1) + x2 + cast_score,data = d_train,family = 'binomial')
+lm1_summary = summary(lm_mod1)
+lm1_coef = lm1_summary$coefficients[,1] 
+
+lm1_summary
+```
+
+From the model output, drama is the more prominent genre that has an significant odds ratio compared to the intercept. Director's quality is also significant, but cast's quality does not seem that significant. This is slightly counter intuitive. 
+
+Let's see how well it performs on test data. 
+
+```{r, warning=FALSE}
+d_test_pred = predict(lm_mod1,d_test,type = 'response')
+cm1 <-confusionMatrix(data = as.factor(as.numeric(d_test_pred>0.5)),reference = as.factor(d_test$outcome))
+cm1
+```
+Accuracy is 0.91, with sensitivity at 0.84 and specificity at 0.94. The model performs alright. 
+
+### Model 1.2
+
+The model we use here:
+
+* outcome ~ genres(X1) + director's quality(X2) + cast's quality version 2 (X3.2)
+
+```{r, warning=FALSE}
+lm_mod1.2 = glm(outcome ~ as.factor(x1) + x2 + cast_score2,data = d_train,family = 'binomial')
+summary(lm_mod1.2)
+d_test_pred1.2 = predict(lm_mod1.2,d_test,type = 'response')
+cm1.2 <-confusionMatrix(data = as.factor(as.numeric(d_test_pred1.2>0.5)),reference = as.factor(d_test$outcome))
+cm1.2
+```
+
+To compare the performance of Model 1 and 1.2, we can also plot the ROC curves and calculate the AUC.
+
+```{r, warning=FALSE}
+roc_lm1 <- roc(d_test$outcome,d_test_pred)
+roc_lm1.2 <- roc(d_test$outcome,d_test_pred1.2)
+auc(roc_lm1)
+auc(roc_lm1.2)
+plot(roc_lm1,col=4)
+plot(roc_lm1.2,col=5, add = TRUE)
+```
+The ROC curve of Model 1 and 1.2 overlap. They also have the same AUC. 
+
+Essentially, when we only change to the 2nd version of the cast score, the modeling result does not change much. Accuracy of Model 1.2 is 0.91, with very similar sensitivity and specificity. `cast_score2` also does not have a significant beta in the model.  Therefore, changing the weight of the actor's score allocation is not bringing significant impact on the model. 
+
+
+### Model 2
+
+The model we use here: 
+
+* outcome2 ~ genres(X1) + director's quality(X2) + cast's quality version 2 (X3.2)
+
+This model has the same predictors as Model 1.2, but different outcome. We are only looking at the worldwide sales here. We want to make money!
+
+```{r, warning=FALSE}
+lm_mod2 = glm(outcome2 ~ as.factor(x1) + x2 + cast_score2,data = d_train, family = 'binomial')
+summary(lm_mod2)
+```
+
+More genre appears to have significant log odds ratio now: animation, biography, comedy, crime, drama. Both directors' and casts' quality are significant for the result. This is more consistent with our intuition. 
+
+
+```{r, warning=FALSE}
+d_test_pred2 = predict(lm_mod2,d_test,type = 'response')
+cm2 <- confusionMatrix(data = as.factor(as.numeric(d_test_pred2>0.5)),reference = as.factor(d_test$outcome2))
+cm2
+```
+The accuracy is 0.91, with sensitivity 0.97 and specificity 0.41. It suggests that if the movie is going to be a commercial success, our model will almost surly pick it up (sensitivity 0.97). However, this model is not very good at picking out the failures. It appears to be quite 'lenient' in judgement: we do not want to miss the next blockbuster, and we are willing to take the risk brought by the low negative prediction value (0.55). It suits the investment funds with deep pockets!
+
+### Model 2.2
+
+The model we use here: 
+
+* outcome2 ~ genres(X1) + director's quality(X2) + cast's quality version 1 (X3)
+
+Model 2.2 is the same as Model 2, except that we change the cast's quality variable to its original form. 
+
+```{r, warning=FALSE}
+lm_mod2.2 = glm(outcome2 ~ as.factor(x1) + x2 + cast_score,data = d_train, family = 'binomial')
+summary(lm_mod2.2)
+```
+
+The result is similar with Model 2. On testing data: 
+
+```{r, warning=FALSE}
+d_test_pred2.2 = predict(lm_mod2.2,d_test,type = 'response')
+cm2.2 <- confusionMatrix(data = as.factor(as.numeric(d_test_pred2.2>0.5)),reference = as.factor(d_test$outcome2))
+cm2.2
+```
+
+Model 2.2 has similar accuracy, sensitivity and specificity as Model 2. ROC curve also gives the same conclusion: 
+
+```{r, warning=FALSE}
+roc_lm2 <- roc(d_test$outcome2,d_test_pred2)
+roc_lm2.2 <- roc(d_test$outcome2,d_test_pred2.2)
+plot(roc_lm2,col=6)
+plot(roc_lm2.2,col='orange', add = TRUE)
+```
+
+## Discussion
+
+* An important issue we did not address above is *multicollinearity* between the X variables. We construct `director's quality` score using rating and award information, and we also construct `cast's quality` score using rating. They *are* going to be related. 
+  + One way to reduce the dependency, is to transform the `rating` information differently when constructing X2 and X3 variables. Hence our self-defence for the seemingly weird way to calculate the director's score above. 
+  + A 2nd way is to introduce interaction terms between X2(director's quality) and X3(cast's quality). We know in reality that good directors tend to work with good actors, and they tend to work with people they already know. 
+
+* We can improve the model by the following: 
+  + Change the scoring system.
+  + Add variables such as `year` to take into account the time effect, and `writer` for the quality of the screenplay. 
+  + address the multicollinearity issue among the X variables. 
+
+## Summary
+
+* Definition of 'success' determines the model's interpretability. In this analysis we fit 4 models: 2 version of outcome (good rating, *or* good sales), in combination of 2 versions of the cast's quality score (with different weight allocation). 
+
+* Model 1 and Model 1.2 hope to predict the probability of whether a movie will receive good rating. While its accuracy is good, it is difficult to reconcile the insiginficant beta for the cast's quality with the fact that actors definitely play a role in the movie's rating. 
+
+* A comparison of the confusion matrix results of the 4 models are below: 
+
+```{r, warning=FALSE}
+compare_cm = 
+  data.frame(lm1 = c(cm1$byClass[1:2]),
+             lm1.2 = c(cm1.2$byClass[1:2]),
+             lm2 = c(cm2$byClass[1:2]),
+             lm2.2 = c(cm2.2$byClass[1:2]))
+
+compare_cm
+```
+
+* Model 2 and Model 2.2 try to predict the probability of having a movie that sells big. The model result is more interpretable: certain genre (e.g. drama, crime, comedy), director and cast are all important for the result. From an investor's perspective, these 2 models' high specificity will prevent us from missing good opportunities, but the caveat is that we may also be tricked to invest on bad movies. 
